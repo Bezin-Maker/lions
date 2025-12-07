@@ -109,6 +109,46 @@ local noRagdollEnabled = false
 local noCollisionEnabled = false
 local neverWantedEnabled = false
 
+-- Armazenar estado original do character (para invisible noclip)
+local originalCharacterState = {}
+local characterStateSaved = false
+
+-- Salvar estado original do character
+local function saveOriginalCharacterState()
+    if Character and not characterStateSaved then
+        originalCharacterState = {}
+        for _, part in pairs(Character:GetDescendants()) do
+            if part:IsA("BasePart") then
+                originalCharacterState[part] = {
+                    CanCollide = part.CanCollide,
+                    Transparency = part.Transparency
+                }
+            elseif part:IsA("Decal") or part:IsA("Texture") then
+                originalCharacterState[part] = {
+                    Transparency = part.Transparency
+                }
+            end
+        end
+        characterStateSaved = true
+    end
+end
+
+-- Restaurar estado original do character
+local function restoreOriginalCharacterState()
+    if Character and characterStateSaved then
+        for part, state in pairs(originalCharacterState) do
+            if part.Parent then -- Verificar se a parte ainda existe
+                if part:IsA("BasePart") then
+                    part.CanCollide = state.CanCollide
+                    part.Transparency = state.Transparency
+                elseif part:IsA("Decal") or part:IsA("Texture") then
+                    part.Transparency = state.Transparency
+                end
+            end
+        end
+    end
+end
+
 -- Função NoClip
 local function toggleNoClip(enabled)
     noclipEnabled = enabled
@@ -136,13 +176,8 @@ local function toggleNoClip(enabled)
             end
         end)
     else
-        if Character then
-            for _, part in pairs(Character:GetDescendants()) do
-                if part:IsA("BasePart") then
-                    part.CanCollide = true
-                end
-            end
-        end
+        -- Restaurar estado original ao invés de forçar tudo para true
+        restoreOriginalCharacterState()
     end
 end
 
@@ -203,6 +238,11 @@ end
 local function toggleInvisible(enabled)
     invisibleEnabled = enabled
     if Character then
+        -- Salvar estado original na primeira vez
+        if not characterStateSaved then
+            saveOriginalCharacterState()
+        end
+        
         for _, part in pairs(Character:GetDescendants()) do
             if part:IsA("BasePart") or part:IsA("Decal") or part:IsA("Texture") then
                 if enabled then
@@ -212,9 +252,11 @@ local function toggleInvisible(enabled)
                         part.Transparency = 1
                     end
                 else
-                    if part:IsA("BasePart") then
-                        part.Transparency = 0
-                    elseif part:IsA("Decal") or part:IsA("Texture") then
+                    -- Restaurar estado original ao invés de forçar para 0
+                    if originalCharacterState[part] then
+                        part.Transparency = originalCharacterState[part].Transparency
+                    else
+                        -- Fallback se não tiver estado salvo
                         part.Transparency = 0
                     end
                 end
@@ -1135,6 +1177,615 @@ local function removeFromFavorites(itemName)
 end
 
 -- ============================================
+-- SISTEMA DE AUTENTICAÇÃO POR KEY
+-- ============================================
+
+local HttpService = game:GetService("HttpService")
+local keyAuthenticated = false
+local savedKey = nil
+
+-- URL do Firebase Realtime Database
+local FIREBASE_URL = "https://blackjack-3d6ff-default-rtdb.europe-west1.firebasedatabase.app"
+
+-- ============================================
+-- SISTEMA HTTP ALTERNATIVO (Sem HttpService)
+-- ============================================
+
+-- Função HTTP universal que tenta múltiplos métodos
+local function httpRequest(url, method, data)
+    method = method or "GET"
+    
+    -- Método 1: Tentar HttpService normal
+    local success1, result1 = pcall(function()
+        if HttpService.HttpEnabled then
+            if method == "GET" then
+                return HttpService:GetAsync(url, true)
+            elseif method == "POST" then
+                return HttpService:PostAsync(url, data or "", Enum.HttpContentType.ApplicationJson, true)
+            end
+        end
+        error("HttpService não habilitado")
+    end)
+    
+    if success1 and result1 then
+        return true, result1
+    end
+    
+    -- Método 2: Tentar game:HttpGet (comum em executores)
+    local success2, result2 = pcall(function()
+        if game.HttpGet then
+            if method == "GET" then
+                return game:HttpGet(url, true)
+            end
+        end
+        error("game:HttpGet não disponível")
+    end)
+    
+    if success2 and result2 then
+        return true, result2
+    end
+    
+    -- Método 3: Tentar request (alguns executores)
+    local success3, result3 = pcall(function()
+        if request then
+            local response = request({
+                Url = url,
+                Method = method,
+                Headers = {
+                    ["Content-Type"] = "application/json"
+                },
+                Body = data or ""
+            })
+            return response.Body
+        end
+        error("request não disponível")
+    end)
+    
+    if success3 and result3 then
+        return true, result3
+    end
+    
+    -- Método 4: Tentar http_request (alguns executores)
+    local success4, result4 = pcall(function()
+        if http_request then
+            local response = http_request({
+                Url = url,
+                Method = method,
+                Headers = {
+                    ["Content-Type"] = "application/json"
+                },
+                Body = data or ""
+            })
+            return response.Body
+        end
+        error("http_request não disponível")
+    end)
+    
+    if success4 and result4 then
+        return true, result4
+    end
+    
+    -- Método 5: Usar servidor proxy intermediário (fallback)
+    local success5, result5 = pcall(function()
+        -- Usar um serviço proxy público (CORS proxy)
+        local proxyUrl = "https://api.allorigins.win/raw?url=" .. url
+        if game.HttpGet then
+            return game:HttpGet(proxyUrl, true)
+        elseif HttpService.HttpEnabled then
+            return HttpService:GetAsync(proxyUrl, true)
+        end
+        error("Proxy não disponível")
+    end)
+    
+    if success5 and result5 then
+        return true, result5
+    end
+    
+    -- Se todos os métodos falharam
+    return false, "Nenhum método HTTP disponível. Tente habilitar HttpService ou use um executor compatível."
+end
+
+-- Função para decodificar JSON (tenta múltiplos métodos)
+local function jsonDecode(data)
+    -- Método 1: HttpService
+    local success1, result1 = pcall(function()
+        return HttpService:JSONDecode(data)
+    end)
+    
+    if success1 and result1 then
+        return result1
+    end
+    
+    -- Método 2: game:JSONDecode (alguns executores)
+    local success2, result2 = pcall(function()
+        if game.JSONDecode then
+            return game:JSONDecode(data)
+        end
+        error("game:JSONDecode não disponível")
+    end)
+    
+    if success2 and result2 then
+        return result2
+    end
+    
+    -- Método 3: Tentar parse manual básico (fallback simples)
+    local success3, result3 = pcall(function()
+        return loadstring("return " .. data)()
+    end)
+    
+    if success3 and result3 then
+        return result3
+    end
+    
+    return nil
+end
+
+-- Função para codificar JSON (tenta múltiplos métodos)
+local function jsonEncode(data)
+    -- Método 1: HttpService
+    local success1, result1 = pcall(function()
+        return HttpService:JSONEncode(data)
+    end)
+    
+    if success1 and result1 then
+        return result1
+    end
+    
+    -- Método 2: game:JSONEncode (alguns executores)
+    local success2, result2 = pcall(function()
+        if game.JSONEncode then
+            return game:JSONEncode(data)
+        end
+        error("game:JSONEncode não disponível")
+    end)
+    
+    if success2 and result2 then
+        return result2
+    end
+    
+    -- Fallback: retornar string simples
+    return tostring(data)
+end
+
+-- Função para verificar key no Firebase
+local function verifyKey(key)
+    local success, result = pcall(function()
+        -- Buscar todas as keys e filtrar localmente (Firebase Realtime Database não suporta queries complexas sem índices)
+        local url = FIREBASE_URL .. "/keys.json"
+        
+        -- Fazer requisição usando método alternativo
+        local httpSuccess, response = httpRequest(url, "GET")
+        
+        if not httpSuccess then
+            error(response or "Erro ao fazer requisição HTTP")
+        end
+        
+        if not response or response == "" or response == "null" then
+            error("Resposta vazia do servidor Firebase")
+        end
+        
+        local allKeys = jsonDecode(response)
+        
+        if not allKeys or type(allKeys) ~= "table" then
+            error("Formato de dados inválido do Firebase")
+        end
+        
+        -- Procurar a key específica
+        local keyData = nil
+        local keyId = nil
+        
+        for id, data in pairs(allKeys) do
+            if data and type(data) == "table" and data.key == key then
+                keyData = data
+                keyId = id
+                break
+            end
+        end
+        
+        if keyData and keyId then
+            return {keyData = keyData, keyId = keyId}
+        else
+            error("Key não encontrada no banco de dados")
+        end
+    end)
+    
+    if not success then
+        local errorMsg = tostring(result)
+        warn("Erro ao conectar com Firebase: " .. errorMsg)
+        
+        -- Mensagens de erro mais específicas
+        -- Verificar se errorMsg contém código HTTP (como "404")
+        if type(errorMsg) == "string" then
+            if errorMsg:find("Nenhum método HTTP") or errorMsg:find("não disponível") then
+                return false, "Nenhum método HTTP disponível.\n\nO sistema tentou múltiplos métodos alternativos mas nenhum funcionou.\nTente usar um executor mais recente ou habilitar HttpService."
+            elseif errorMsg:find("timeout") or errorMsg:find("timed out") then
+                return false, "Timeout ao conectar com o servidor. Tente novamente."
+            elseif errorMsg:find("404") or errorMsg:match("^404") or errorMsg:match("%s404%s") then
+                return false, "Servidor não encontrado (404). Verifique a URL do Firebase."
+            else
+                -- Limpar mensagem de erro para evitar problemas de parsing
+                local cleanMsg = tostring(errorMsg):gsub("[^%w%s%p]", "")
+                return false, "Erro ao conectar: " .. cleanMsg
+            end
+        else
+            return false, "Erro desconhecido ao conectar com o servidor"
+        end
+    end
+    
+    if not result or not result.keyData or not result.keyId then
+        return false, "Key inválida ou não encontrada"
+    end
+    
+    local keyData = result.keyData
+    local keyId = result.keyId
+    
+    -- Validar e converter tipos de dados
+    if not keyData or type(keyData) ~= "table" then
+        return false, "Dados da key inválidos"
+    end
+    
+    -- Converter duration para número
+    local duration = keyData.duration
+    if type(duration) == "string" then
+        duration = tonumber(duration) or 0
+    elseif type(duration) ~= "number" then
+        duration = 0
+    end
+    
+    if duration == 0 then
+        return false, "Duração da key inválida"
+    end
+    
+    -- Usar os.time() para timestamp (segundos desde epoch Unix)
+    local now = os.time()
+    local firstUsed = keyData.firstUsed
+    local currentUserId = tostring(LocalPlayer.UserId)
+    local activeUserId = keyData.activeUserId
+    
+    -- Converter firstUsed para número se for string ou tabela
+    if type(firstUsed) == "string" then
+        firstUsed = tonumber(firstUsed) or nil
+    elseif type(firstUsed) == "table" then
+        firstUsed = nil
+    elseif type(firstUsed) ~= "number" then
+        firstUsed = nil
+    end
+    
+    -- Verificar se key está sendo usada por outro jogador
+    if activeUserId and type(activeUserId) == "string" and activeUserId ~= "" and activeUserId ~= currentUserId then
+        -- Verificar se o outro jogador ainda está ativo (última atualização há menos de 2 minutos)
+        local lastActive = keyData.lastActive or 0
+        
+        -- Converter lastActive para número
+        if type(lastActive) == "string" then
+            lastActive = tonumber(lastActive) or 0
+        elseif type(lastActive) == "table" then
+            lastActive = 0
+        elseif type(lastActive) ~= "number" then
+            lastActive = 0
+        end
+        
+        if now - lastActive < 120 then -- 2 minutos
+            return false, "Esta key já está em uso em outro dispositivo.\nApenas um dispositivo pode usar a key por vez."
+        end
+    end
+    
+    -- Se é a primeira vez usando
+    if not firstUsed or firstUsed == 0 then
+        -- Registrar primeira utilização
+        if keyId then
+            -- Converter dias para segundos corretamente (duration já foi convertido acima)
+            local durationInSeconds = duration * 24 * 60 * 60
+            local expiresAt = now + durationInSeconds
+            
+            local updateSuccess = pcall(function()
+                -- Salvar timestamp atual, expiresAt e usuário ativo
+                local updateUrl = FIREBASE_URL .. "/keys/" .. keyId .. "/firstUsed.json"
+                httpRequest(updateUrl, "POST", tostring(now))
+                
+                local expiresUrl = FIREBASE_URL .. "/keys/" .. keyId .. "/expiresAt.json"
+                httpRequest(expiresUrl, "POST", tostring(expiresAt))
+                
+                local activeUserUrl = FIREBASE_URL .. "/keys/" .. keyId .. "/activeUserId.json"
+                httpRequest(activeUserUrl, "POST", "\"" .. currentUserId .. "\"")
+                
+                local lastActiveUrl = FIREBASE_URL .. "/keys/" .. keyId .. "/lastActive.json"
+                httpRequest(lastActiveUrl, "POST", tostring(now))
+                
+                -- Salvar key localmente
+                pcall(function()
+                    local savedKeys = LocalPlayer:FindFirstChild("BlackJackKey")
+                    if savedKeys then
+                        savedKeys:Destroy()
+                    end
+                    savedKeys = Instance.new("StringValue")
+                    savedKeys.Name = "BlackJackKey"
+                    savedKeys.Value = key
+                    savedKeys.Parent = LocalPlayer
+                end)
+            end)
+            
+            if not updateSuccess then
+                warn("Erro ao atualizar key no Firebase")
+            end
+            
+            -- Salvar key localmente
+            pcall(function()
+                local savedKeys = LocalPlayer:FindFirstChild("BlackJackKey")
+                if savedKeys then
+                    savedKeys:Destroy()
+                end
+                savedKeys = Instance.new("StringValue")
+                savedKeys.Name = "BlackJackKey"
+                savedKeys.Value = key
+                savedKeys.Parent = LocalPlayer
+            end)
+            
+            return true, "Key ativada com sucesso! Válida por " .. tostring(duration) .. " dias."
+        end
+    else
+        -- Verificar se ainda está válida
+        local expiresAt = keyData.expiresAt
+        
+        -- Converter para número se for string
+        if type(expiresAt) == "string" then
+            expiresAt = tonumber(expiresAt) or 0
+        end
+        
+        if not expiresAt or expiresAt == 0 then
+            -- Se não tem expiresAt mas tem firstUsed, calcular
+            if firstUsed and firstUsed > 0 then
+                expiresAt = firstUsed + (duration * 24 * 60 * 60)
+            else
+                return false, "Key com dados corrompidos"
+            end
+        end
+        
+        if now > expiresAt then
+            return false, "Key expirada. Por favor, adquira uma nova key."
+        end
+        
+        -- Atualizar usuário ativo e último acesso
+        pcall(function()
+            local activeUserUrl = FIREBASE_URL .. "/keys/" .. keyId .. "/activeUserId.json"
+            httpRequest(activeUserUrl, "POST", "\"" .. currentUserId .. "\"")
+            
+            local lastActiveUrl = FIREBASE_URL .. "/keys/" .. keyId .. "/lastActive.json"
+            httpRequest(lastActiveUrl, "POST", tostring(now))
+        end)
+        
+        -- Salvar key localmente se ainda não estiver salva
+        pcall(function()
+            local savedKeys = LocalPlayer:FindFirstChild("BlackJackKey")
+            if not savedKeys then
+                savedKeys = Instance.new("StringValue")
+                savedKeys.Name = "BlackJackKey"
+                savedKeys.Value = key
+                savedKeys.Parent = LocalPlayer
+            end
+        end)
+        
+        local daysLeft = math.floor((expiresAt - now) / (24 * 60 * 60))
+        local hoursLeft = math.floor(((expiresAt - now) % (24 * 60 * 60)) / (60 * 60))
+        return true, "Key válida! Restam " .. daysLeft .. " dias e " .. hoursLeft .. " horas."
+    end
+    
+    return false, "Erro desconhecido"
+end
+
+-- Função para verificar key salva
+local function checkSavedKey()
+    local savedKeys = LocalPlayer:FindFirstChild("BlackJackKey")
+    if savedKeys then
+        local key = savedKeys.Value
+        local valid, message = verifyKey(key)
+        if valid then
+            keyAuthenticated = true
+            savedKey = key
+            return true
+        else
+            -- Remover key inválida
+            savedKeys:Destroy()
+        end
+    end
+    return false
+end
+
+-- Tela de autenticação
+local function showKeyAuthScreen()
+    local authGui = Instance.new("ScreenGui")
+    authGui.Name = "KeyAuthScreen"
+    authGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    authGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    authGui.ResetOnSpawn = false
+    
+    local authFrame = Instance.new("Frame")
+    authFrame.Name = "AuthFrame"
+    authFrame.Parent = authGui
+    authFrame.Size = UDim2.new(0, 500, 0, 400)
+    authFrame.Position = UDim2.new(0.5, -250, 0.5, -200)
+    authFrame.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+    authFrame.BorderSizePixel = 0
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 12)
+    corner.Parent = authFrame
+    
+    -- Logo/Título
+    local logoImage = Instance.new("ImageLabel")
+    logoImage.Name = "LogoImage"
+    logoImage.Parent = authFrame
+    logoImage.Size = UDim2.new(0, 80, 0, 120)
+    logoImage.Position = UDim2.new(0.5, -40, 0, 20)
+    logoImage.Image = "rbxassetid://124561513989824"
+    logoImage.BackgroundTransparency = 1
+    
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Parent = authFrame
+    titleLabel.Size = UDim2.new(1, -40, 0, 40)
+    titleLabel.Position = UDim2.new(0, 20, 0, 150)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.Text = "BlackJack Menu"
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextSize = 24
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Center
+    
+    local subtitleLabel = Instance.new("TextLabel")
+    subtitleLabel.Parent = authFrame
+    subtitleLabel.Size = UDim2.new(1, -40, 0, 30)
+    subtitleLabel.Position = UDim2.new(0, 20, 0, 190)
+    subtitleLabel.BackgroundTransparency = 1
+    subtitleLabel.Font = Enum.Font.Gotham
+    subtitleLabel.Text = "Insira sua key de licença"
+    subtitleLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    subtitleLabel.TextSize = 14
+    subtitleLabel.TextXAlignment = Enum.TextXAlignment.Center
+    
+    -- Input de key
+    local inputFrame = Instance.new("Frame")
+    inputFrame.Parent = authFrame
+    inputFrame.Size = UDim2.new(1, -40, 0, 40)
+    inputFrame.Position = UDim2.new(0, 20, 0, 240)
+    inputFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    inputFrame.BorderSizePixel = 0
+    
+    local inputCorner = Instance.new("UICorner")
+    inputCorner.CornerRadius = UDim.new(0, 6)
+    inputCorner.Parent = inputFrame
+    
+    local keyInput = Instance.new("TextBox")
+    keyInput.Parent = inputFrame
+    keyInput.Size = UDim2.new(1, -20, 1, -10)
+    keyInput.Position = UDim2.new(0, 10, 0, 5)
+    keyInput.BackgroundTransparency = 1
+    keyInput.Font = Enum.Font.Gotham
+    keyInput.PlaceholderText = "Cole sua key aqui..."
+    keyInput.PlaceholderColor3 = Color3.fromRGB(100, 100, 100)
+    keyInput.Text = ""
+    keyInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+    keyInput.TextSize = 14
+    keyInput.TextXAlignment = Enum.TextXAlignment.Left
+    
+    -- Botão de autenticação
+    local authButton = Instance.new("TextButton")
+    authButton.Parent = authFrame
+    authButton.Size = UDim2.new(1, -40, 0, 40)
+    authButton.Position = UDim2.new(0, 20, 0, 300)
+    authButton.BackgroundColor3 = Color3.fromRGB(150, 0, 30)
+    authButton.BorderSizePixel = 0
+    authButton.Font = Enum.Font.GothamBold
+    authButton.Text = "AUTENTICAR"
+    authButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    authButton.TextSize = 16
+    
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 6)
+    btnCorner.Parent = authButton
+    
+    -- Mensagem de status
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Parent = authFrame
+    statusLabel.Size = UDim2.new(1, -40, 0, 30)
+    statusLabel.Position = UDim2.new(0, 20, 0, 270)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Font = Enum.Font.Gotham
+    statusLabel.Text = ""
+    statusLabel.TextColor3 = Color3.fromRGB(255, 0, 0)
+    statusLabel.TextSize = 12
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Center
+    statusLabel.TextWrapped = true
+    
+    -- Função de autenticação
+    local function authenticate()
+        
+        local key = keyInput.Text:gsub("%s+", "") -- Remover espaços
+        if key == "" or #key ~= 50 then
+            statusLabel.Text = "Por favor, insira uma key válida (50 caracteres)"
+            statusLabel.TextColor3 = Color3.fromRGB(255, 0, 0)
+            return
+        end
+        
+        statusLabel.Text = "Verificando key..."
+        statusLabel.TextColor3 = Color3.fromRGB(255, 255, 0)
+        authButton.Text = "VERIFICANDO..."
+        authButton.Active = false
+        
+        spawn(function()
+            local valid, message = verifyKey(key)
+            
+            if valid then
+                keyAuthenticated = true
+                savedKey = key
+                statusLabel.Text = message
+                statusLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
+                
+                wait(1)
+                
+                -- Fechar tela de autenticação
+                authGui:Destroy()
+                
+                -- Iniciar menu
+                startMenu()
+            else
+                statusLabel.Text = message
+                statusLabel.TextColor3 = Color3.fromRGB(255, 0, 0)
+                authButton.Text = "AUTENTICAR"
+                authButton.Active = true
+            end
+        end)
+    end
+    
+    authButton.MouseButton1Click:Connect(authenticate)
+    keyInput.FocusLost:Connect(function(enterPressed)
+        if enterPressed then
+            authenticate()
+        end
+    end)
+    
+    -- Testar conexão HTTP ao abrir a tela
+    spawn(function()
+        wait(0.1)
+        statusLabel.Text = "Testando conexão..."
+        statusLabel.TextColor3 = Color3.fromRGB(255, 255, 0)
+        
+        -- Testar se algum método HTTP funciona
+        local testSuccess, testResult = pcall(function()
+            local testUrl = FIREBASE_URL .. "/.json"
+            return httpRequest(testUrl, "GET")
+        end)
+        
+        if testSuccess then
+            statusLabel.Text = "Conexão OK! Insira sua key."
+            statusLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
+            wait(2)
+            statusLabel.Text = ""
+        else
+            statusLabel.Text = "Aviso: Alguns métodos HTTP podem não estar disponíveis.\nTente autenticar mesmo assim."
+            statusLabel.TextColor3 = Color3.fromRGB(255, 200, 0)
+        end
+    end)
+    
+    -- Focar no input
+    wait(0.5)
+    keyInput:CaptureFocus()
+end
+
+-- Função para iniciar o menu (será chamada após autenticação)
+local function startMenu()
+    keyAuthenticated = true
+    if createMainMenu then
+        createMainMenu()
+    end
+end
+
+-- Função para criar o menu principal (será definida depois)
+local createMainMenu = nil
+
+-- Função para criar o menu principal (será definida depois)
+local createMainMenu = nil
+
+-- ============================================
 -- ANIMAÇÃO INICIAL DO LOGO
 -- ============================================
 
@@ -1164,7 +1815,6 @@ local function showLogoAnimation()
     
     -- Animação de aparecer
     local targetSize = UDim2.new(0, 400, 0, 600)
-    local startTime = tick()
     local duration = 1.5
     
     local tween = game:GetService("TweenService"):Create(
@@ -1194,10 +1844,17 @@ local function showLogoAnimation()
     
     fadeOutLogo.Completed:Connect(function()
         logoScreen:Destroy()
+        -- Após logo desaparecer, verificar key e mostrar tela de autenticação se necessário
+        if not checkSavedKey() then
+            showKeyAuthScreen()
+        else
+            keyAuthenticated = true
+            startMenu()
+        end
     end)
 end
 
--- Executar animação inicial
+-- Executar animação do logo primeiro
 spawn(showLogoAnimation)
 
 -- ============================================
@@ -1257,7 +1914,22 @@ end)
 -- Sistema de detecção da tecla Ç - usar apenas InputBegan para evitar bloqueio de inputs
 -- Removido TextBox que estava bloqueando inputs
 
--- Propriedades principais
+-- Propriedades principais (apenas se autenticado)
+if not keyAuthenticated then
+    -- Aguardar autenticação
+    spawn(function()
+        while not keyAuthenticated do
+            wait(0.1)
+        end
+        -- Após autenticação, criar menu
+        createMainMenu()
+    end)
+else
+    createMainMenu()
+end
+
+-- Função para criar o menu principal
+createMainMenu = function()
 BlackJackMenu.Name = "BlackJackMenu"
 BlackJackMenu.Parent = game.Players.LocalPlayer:WaitForChild("PlayerGui")
 BlackJackMenu.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -1918,6 +2590,10 @@ local tabContents = {
         end, "noClip")
         createToggle(ConditionsPanel, "InvisibleNoClip", "Invisible NoClip", 290, globalStates.invisibleNoClip, true, function(enabled)
             globalStates.invisibleNoClip = enabled
+            -- Salvar estado original antes de ativar
+            if enabled and not characterStateSaved then
+                saveOriginalCharacterState()
+            end
             toggleNoClip(enabled)
             toggleInvisible(enabled)
         end, "invisibleNoClip")
@@ -2371,6 +3047,38 @@ end)
 -- Carregar aba inicial
 switchTab("Local Player", WorldBtn)
 
+-- Verificar periodicamente se a key ainda é válida e uso simultâneo (a cada 30 segundos)
+spawn(function()
+    while keyAuthenticated and savedKey do
+        wait(30) -- 30 segundos
+        local valid, message = verifyKey(savedKey)
+        if not valid then
+            -- Key expirada ou em uso por outro, expulsar jogador
+            keyAuthenticated = false
+            LocalPlayer:Kick("Sua key expirou ou está sendo usada em outro dispositivo. " .. (message or ""))
+            break
+        else
+            -- Atualizar lastActive para manter sessão ativa
+            pcall(function()
+                local url = FIREBASE_URL .. "/keys.json"
+                local httpSuccess, response = httpRequest(url, "GET")
+                if httpSuccess and response then
+                    local allKeys = jsonDecode(response)
+                    if allKeys then
+                        for id, data in pairs(allKeys) do
+                            if data and data.key == savedKey then
+                                local lastActiveUrl = FIREBASE_URL .. "/keys/" .. id .. "/lastActive.json"
+                                httpRequest(lastActiveUrl, "POST", tostring(os.time()))
+                                break
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
 print("═══════════════════════════════════════")
 print("  🎰 BLACKJACK MENU LOADED SUCCESSFULLY! 🎰")
 print("═══════════════════════════════════════")
@@ -2380,3 +3088,4 @@ print("📌 Current Tab: " .. currentTab)
 print("📌 Drag the window to move it")
 print("📌 Right-click on options to add to favorites!")
 print("═══════════════════════════════════════")
+end -- Fim da função createMainMenu
